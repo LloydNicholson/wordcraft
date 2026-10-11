@@ -11,6 +11,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod bidi;
+pub mod control;
+pub mod chart;
 pub mod edit;
 pub mod effects;
 pub mod encoding;
@@ -37,6 +39,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use control::{ContentControl, ControlKind, ControlLock, ControlRange, ControlWrap};
 pub use fields::FieldRange;
 pub use numbering::{ListKind, Numbering};
 pub use para::{InlineObject, Paragraph, Run};
@@ -331,7 +334,7 @@ impl Document {
 pub struct Source {
     /// Unique tag cited by CITATION fields.
     pub tag: String,
-    /// book, article, website, report, film, other
+    /// book, bookSection, article (journal), periodical, conference, report, website, film, other
     pub kind: String,
     /// "Last, First; Last, First"
     pub author: String,
@@ -343,6 +346,15 @@ pub struct Source {
     pub volume: String,
     pub pages: String,
     pub url: String,
+    /// More bibliography fields (Create Source › Show All Bibliography Fields).
+    pub editor: String,
+    pub edition: String,
+    pub issue: String,
+    pub month: String,
+    pub day: String,
+    /// Date accessed (websites).
+    pub accessed: String,
+    pub doi: String,
 }
 
 /// A custom document property (File › Info › Properties › Custom). Citation managers keep
@@ -382,6 +394,13 @@ pub struct Settings {
     pub even_odd_headers: bool,
     pub mirror_margins: bool,
     pub auto_hyphenation: bool,
+    /// Hyphenation zone (`w:hyphenationZone`), points: a line is hyphenated only when breaking
+    /// it at a word boundary would leave more than this empty at its end.
+    pub hyphenation_zone: f32,
+    /// Words in capitals may be hyphenated (`w:doNotHyphenateCaps` turns it off).
+    pub hyphenate_caps: bool,
+    /// Most consecutive lines that may end with a hyphen (`w:consecutiveHyphenLimit`); 0 = no limit.
+    pub consecutive_hyphen_limit: u32,
     pub page_color: Option<Rgb>,
     pub watermark: Option<Watermark>,
     /// Theme fonts (major = headings, minor = body).
@@ -416,6 +435,9 @@ pub const LEGACY_COMPAT_MODE: u32 = 12;
 
 /// The compatibility mode of documents created by Word 2013 and later, and by WordCraft.
 pub const COMPAT_MODE_CURRENT: u32 = 15;
+
+/// Word's hyphenation zone when a document doesn't set one (0.25"), points.
+pub const DEFAULT_HYPHENATION_ZONE: f32 = 18.0;
 
 /// ECMA-376 §17.15.1.44/45: 180 twentieths of a point when a document doesn't say.
 pub const DEFAULT_GRID: f32 = 9.0;
@@ -460,6 +482,9 @@ impl Default for Settings {
             even_odd_headers: false,
             mirror_margins: false,
             auto_hyphenation: false,
+            hyphenation_zone: DEFAULT_HYPHENATION_ZONE,
+            hyphenate_caps: true,
+            consecutive_hyphen_limit: 0,
             page_color: None,
             watermark: None,
             major_font: styles::HEADING_FONT.into(),

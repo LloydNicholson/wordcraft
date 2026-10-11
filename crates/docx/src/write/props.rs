@@ -257,6 +257,7 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool, num_change: Option<&Cha
     toggle(w, "w:autoSpaceDE", p.auto_space_de);
     toggle(w, "w:autoSpaceDN", p.auto_space_dn);
     toggle(w, "w:bidi", p.bidi);
+    toggle(w, "w:snapToGrid", p.snap_to_grid);
     if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
         let before = p.space_before.map(|v| twips(v.max(0.0)));
         let after = p.space_after.map(|v| twips(v.max(0.0)));
@@ -393,6 +394,9 @@ fn tblpr_inner(w: &mut W, t: &TableProps) {
     w.empty("w:tblLook", &refs);
     if let Some(c) = &t.caption {
         w.val("w:tblCaption", c);
+    }
+    if let Some(d) = &t.description {
+        w.val("w:tblDescription", d);
     }
 }
 

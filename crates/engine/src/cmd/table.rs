@@ -144,6 +144,23 @@ pub fn specs() -> Vec<CommandSpec> {
                 }
             })
         })),
+        // Table Properties › Alt Text: the title (`w:tblCaption`) and description (`w:tblDescription`).
+        t(CommandSpec::new("table.altText", "Alt Text", "Table Layout › Table › Properties", |s, v| {
+            let (title, text) = (p::str(v, "title"), p::str(v, "text"));
+            if title.is_none() && text.is_none() {
+                return Err(CmdError::Params("`text` or `title` (string) is required".into()));
+            }
+            let set = |x: Option<&str>, cur: &Option<String>| match x {
+                Some(x) if x.trim().is_empty() => None,
+                Some(x) => Some(wordcraft_doc::para::cap_alt(x)),
+                None => cur.clone(),
+            };
+            with_table(s, |t| {
+                t.props.caption = set(title, &t.props.caption);
+                t.props.description = set(text, &t.props.description);
+            })
+        })
+        .params(r#"{"text"?: string, "title"?: string} (empty clears)"#)),
         t(CommandSpec::new("table.sort", "Sort", "Table Layout › Data", sort_table)
             .params(r#"{"column"?: n, "descending"?: bool, "header"?: bool}"#)),
         t(CommandSpec::new("table.toText", "Convert to Text", "Table Layout › Data", to_text).params(r#"{"separator"?: "tab|comma|paragraph"}"#)),
@@ -527,7 +544,10 @@ fn split_table(s: &mut Session, _: &Value) -> CmdResult {
     let story = s.sel.focus.story;
     let t = s.doc.table_mut(story, &tp)?;
     let tail_rows = t.rows.split_off(r);
-    let tail = Table { props: t.props.clone(), grid: t.grid.clone(), rows: tail_rows };
+    // Content controls closing after the table now close after its second part.
+    let close = std::mem::take(&mut t.controls.close);
+    let controls = wordcraft_doc::ControlWrap { open: Vec::new(), close };
+    let tail = Table { props: t.props.clone(), grid: t.grid.clone(), rows: tail_rows, controls };
     let after = tp.with_last(tp.last() + 1);
     s.doc.insert_block(story, &after, Block::Para(Paragraph::new()))?;
     s.doc.insert_block(story, &after.with_last(after.last() + 1), Block::Table(tail))?;

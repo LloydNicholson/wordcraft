@@ -2,11 +2,15 @@
 
 use std::collections::HashMap;
 
+use wordcraft_doc::para::cap_alt;
 use wordcraft_doc::props::{
     Align, Border, BorderStyle, Borders, CellProps, CharProps, HeightRule, Highlight, LineSpacing, NumRef, ParaProps, Rgb, RowProps, TabAlign,
     TabLeader, TabStop, TableFloat, TableLook, TableProps, TextColor, TextDirection, Underline, VAlign, VMerge, VertAlign,
 };
-use wordcraft_doc::section::{Columns, LineNumberRestart, LineNumbering, NotePos, NoteProps, NoteRestart, NumFormat, SectionProps, SectionStart};
+use wordcraft_doc::section::{
+    Columns, DocGrid, DocGridType, LineNumberRestart, LineNumbering, MAX_CHAR_SPACE, MAX_GRID_PITCH, NotePos, NoteProps, NoteRestart, NumFormat,
+    SectionProps, SectionStart,
+};
 
 use super::drawing_color::adjust_lum;
 use crate::units::{int, measure, on_off, tw, u32_of};
@@ -208,6 +212,7 @@ impl PropCtx {
                 "w:topLinePunct" => p.top_line_punct = Some(on_off(k)),
                 "w:autoSpaceDE" => p.auto_space_de = Some(on_off(k)),
                 "w:autoSpaceDN" => p.auto_space_dn = Some(on_off(k)),
+                "w:snapToGrid" => p.snap_to_grid = Some(on_off(k)),
                 "w:framePr" => {
                     if matches!(k.attr("w:dropCap"), Some("drop") | Some("margin")) {
                         p.drop_cap = Some(k.attr("w:lines").and_then(u32_of).unwrap_or(3).clamp(1, 10) as u8);
@@ -373,8 +378,8 @@ impl PropCtx {
                         f.overlap = k.attr("w:val") != Some("never");
                     }
                 }
-                "w:tblCaption" => t.caption = k.attr("w:val").map(str::to_string),
-                "w:tblDescription" if t.caption.is_none() => t.caption = k.attr("w:val").map(str::to_string),
+                "w:tblCaption" => t.caption = k.attr("w:val").map(cap_alt),
+                "w:tblDescription" => t.description = k.attr("w:val").map(cap_alt),
                 _ => {}
             }
         }
@@ -580,6 +585,19 @@ pub fn sectpr(e: &El) -> (SectionProps, Vec<HfRef>) {
                 }
             }
             "w:pgBorders" => s.page_borders = Some(borders(k)),
+            "w:docGrid" => {
+                let mut g = DocGrid::default();
+                if let Some(t) = k.attr("w:type").and_then(DocGridType::from_ooxml) {
+                    g.kind = t;
+                }
+                if let Some(p) = tw(k, "w:linePitch").filter(|v| v.is_finite() && *v > 0.0) {
+                    g.line_pitch = p.min(MAX_GRID_PITCH);
+                }
+                if let Some(c) = k.attr("w:charSpace").and_then(int) {
+                    g.char_space = c.clamp(-(MAX_CHAR_SPACE as i64), MAX_CHAR_SPACE as i64) as i32;
+                }
+                s.doc_grid = Some(g);
+            }
             _ => {}
         }
     }

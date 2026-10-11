@@ -68,6 +68,12 @@ pub struct ViewState {
     /// The Clipboard pane (Home › Clipboard): items collected by Copy and Cut.
     #[serde(default)]
     pub clipboard_pane: bool,
+    /// The Accessibility pane (Review › Check Accessibility): the checker's findings.
+    #[serde(default)]
+    pub accessibility_pane: bool,
+    /// The Alt Text pane (Picture/Shape Format › Alt Text): the selected object's or table's alt text.
+    #[serde(default)]
+    pub alt_text_pane: bool,
     pub multi_page: bool,
     /// Zoom to fit: "pageWidth", "onePage", "multiplePages", or empty.
     pub fit: String,
@@ -86,6 +92,9 @@ pub struct ViewState {
     /// Show field codes instead of their results (`view.fieldCodes`, Alt+F9).
     #[serde(default)]
     pub field_codes: bool,
+    /// Developer › Design Mode: every content control shows its frame and title.
+    #[serde(default)]
+    pub design_mode: bool,
 }
 
 fn on() -> bool {
@@ -108,6 +117,8 @@ impl Default for ViewState {
             style_inspector: false,
             comments_pane: false,
             clipboard_pane: false,
+            accessibility_pane: false,
+            alt_text_pane: false,
             multi_page: false,
             fit: String::new(),
             web_width: 800.0,
@@ -118,6 +129,7 @@ impl Default for ViewState {
             hide_ink: false,
             draw: Default::default(),
             field_codes: false,
+            design_mode: false,
         }
     }
 }
@@ -304,11 +316,13 @@ pub struct Prefs {
     /// Track Changes Options: what markup shows and how revisions are drawn (per user, as in
     /// Word).
     pub markup: wordcraft_layout::display::MarkupOptions,
+    /// Language › Detect language automatically (per user, as in Word).
+    pub detect_language: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { count_notes: true, markup: Default::default() }
+        Prefs { count_notes: true, markup: Default::default(), detect_language: true }
     }
 }
 

@@ -8,7 +8,7 @@ use wordcraft_doc::props::{
     Align, Border, BorderStyle, Borders, CharProps, HeightRule, Highlight, LineSpacing, NumRef, ParaProps, Rgb, RowProps, TabAlign, TabLeader,
     TabStop, TableLook, TextColor, TextDirection, Underline, VAlign, VMerge, VertAlign,
 };
-use wordcraft_doc::section::{Columns, LineNumberRestart, LineNumbering, NumFormat, SectionProps, SectionStart};
+use wordcraft_doc::section::{Columns, DocGrid, DocGridType, LineNumberRestart, LineNumbering, NumFormat, SectionProps, SectionStart};
 use wordcraft_doc::styles::{Style, StyleKind};
 use wordcraft_doc::table::{Cell, Table};
 use wordcraft_doc::{Block, Blocks, Comment, Document, InlineObject, Paragraph, PartKind, Revision, RevisionKind, Watermark, para_block};
@@ -145,6 +145,7 @@ fn every_para_prop_round_trips() {
         auto_space_dn: Some(true),
         num_change: None,
         fmt_change: None,
+        snap_to_grid: Some(false),
     };
     let variants = [
         ParaProps { line_spacing: Some(LineSpacing::AtLeast(14.0)), indent_first: Some(24.0), align: Some(Align::Center), ..Default::default() },
@@ -293,12 +294,14 @@ fn sections_headers_footers_round_trip() {
         page_borders: Some(Borders::box_(Border::single(1.0))),
         line_numbers: Some(LineNumbering { count_by: 5, start: 1, distance: 18.0, restart: LineNumberRestart::Section }),
         gutter: 18.0,
+        // #391: a line and character grid (Word writes `w:docGrid` even without a grid).
+        doc_grid: Some(DocGrid { kind: DocGridType::LinesAndChars, line_pitch: 17.5, char_space: -1843 }),
         ..Default::default()
     };
     s1.headers.default = Some(h1);
     s1.headers.first = Some(hf);
     s1.footers.default = Some(f1);
-    let mut s2 = SectionProps { start: SectionStart::OddPage, rtl: true, ..Default::default() };
+    let mut s2 = SectionProps { start: SectionStart::OddPage, rtl: true, doc_grid: Some(DocGrid::default()), ..Default::default() };
     s2.set_landscape(true);
     s2.columns = Columns { count: 2, space: 24.0, separator: true, widths: Vec::new() };
     s2.footers.default = Some(f2);
@@ -1113,6 +1116,10 @@ fn settings_core_theme_round_trip() {
     d.settings.even_odd_headers = true;
     d.settings.mirror_margins = true;
     d.settings.auto_hyphenation = true;
+    // Hyphenation Options (#407): zone, words in capitals, consecutive hyphens.
+    d.settings.hyphenation_zone = 27.0;
+    d.settings.hyphenate_caps = false;
+    d.settings.consecutive_hyphen_limit = 2;
     d.settings.page_color = Some(Rgb(250, 240, 230));
     d.settings.major_font = "Cambria".into();
     d.settings.minor_font = "Calibri".into();
@@ -1370,7 +1377,8 @@ fn list_level_overrides_round_trip() {
 }
 
 /// Ink strokes and freeform shapes are written as DrawingML custom geometry (`a:custGeom`,
-/// `a:moveTo`/`a:lnTo`) in floating drawings and read back with their points, pen and opacity.
+/// `a:moveTo`/`a:lnTo`) in floating drawings and read back with their points, pen, opacity and
+/// drawing order.
 #[test]
 fn ink_and_freeforms_round_trip_as_custom_geometry() {
     use wordcraft_doc::freeform::{FreePath, Freeform, InkTool};
@@ -1386,7 +1394,13 @@ fn ink_and_freeforms_round_trip_as_custom_geometry() {
         freeform: Some(Arc::new(f)),
         effects: Default::default(),
     };
-    let pen = shape(None, 2.0, Wrap::InFrontOfText, Freeform::ink(InkTool::Pen, 60.0, 20.0, vec![[1.0, 1.0], [30.0, 19.0], [59.0, 4.0]]));
+    // The pen stroke was the seventh drawn: Ink Replay's order comes back too.
+    let pen = shape(
+        None,
+        2.0,
+        Wrap::InFrontOfText,
+        Freeform { order: Some(7), ..Freeform::ink(InkTool::Pen, 60.0, 20.0, vec![[1.0, 1.0], [30.0, 19.0], [59.0, 4.0]]) },
+    );
     let marker = shape(None, 12.0, Wrap::BehindText, Freeform::ink(InkTool::Highlighter, 80.0, 12.0, vec![[6.0, 6.0], [74.0, 6.0]]));
     let triangle = Freeform {
         w: 40.0,
@@ -1767,4 +1781,78 @@ fn wrap_text_sides_round_trip() {
     assert_eq!(got, sides);
     // A value outside the schema is no side (read as both sides).
     assert_eq!(WrapText::from_ooxml("middle"), None);
+}
+
+#[test]
+fn alt_text_title_and_decorative_round_trip_for_every_object() {
+    use wordcraft_doc::para::AltText;
+    let mut d = Document::new();
+    let key = d.add_media(tiny_png(), "png");
+    let pic = InlineObject::Image {
+        media: key,
+        w: 100.0,
+        h: 50.0,
+        alt: "A kiln at dusk".into(),
+        float: Float { alt: AltText { title: "Kiln".into(), ..Default::default() }, ..Default::default() },
+        crop: [0.0; 4],
+        ole: None,
+    };
+    let shape = |alt: AltText| InlineObject::Shape {
+        kind: ShapeKind::Ellipse,
+        w: 80.0,
+        h: 40.0,
+        fill: Some(Rgb(1, 2, 3)),
+        stroke: None,
+        stroke_width: 0.0,
+        float: Float { alt, ..Default::default() },
+        story: None,
+        effects: Default::default(),
+        freeform: None,
+    };
+    let described = shape(AltText { text: "Process flow & \"steps\"".into(), ..Default::default() });
+    let decorative = shape(AltText { decorative: true, ..Default::default() });
+    let group = InlineObject::Group {
+        w: 120.0,
+        h: 60.0,
+        float: Float { alt: AltText { text: "Two circles".into(), ..Default::default() }, ..Default::default() },
+        ch_w: 120.0,
+        ch_h: 60.0,
+        children: vec![wordcraft_doc::para::GroupChild { x: 0.0, y: 0.0, obj: shape(AltText { text: "Left circle".into(), ..Default::default() }) }],
+        canvas: None,
+    };
+    let mut p = Paragraph::with_text("objects ", CharProps::default());
+    for o in [pic, described, decorative, group] {
+        let end = p.len();
+        p.insert_object(end, o, &CharProps::default()).unwrap();
+    }
+    let mut t = Table::new(2, 2, 300.0);
+    t.props.caption = Some("Prices".into());
+    t.props.description = Some("Prices by year".into());
+    d.body = vec![para_block(p), Arc::new(Block::Table(t))];
+    let bytes = wordcraft_docx::write(&d).expect("write");
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
+    assert!(xml.contains(r#"{C183D7F6-B498-43B3-948B-1728B52AA6E4}"><adec:decorative xmlns:adec="http://schemas.microsoft.com/office/drawing/2017/decorative" val="1"/>"#), "{xml}");
+    assert!(
+        xml.contains(r#"<w:tblLook "#) && xml.contains(r#"<w:tblCaption w:val="Prices"/><w:tblDescription w:val="Prices by year"/></w:tblPr>"#),
+        "{xml}"
+    );
+    let r = wordcraft_docx::read(&bytes).expect("read");
+    let objs = &paras(&r)[0].objects;
+    let alts: Vec<_> =
+        objs.iter().map(|o| (o.alt_text().to_string(), o.frame().map(|f| f.2.alt.title.clone()).unwrap_or_default(), o.is_decorative())).collect();
+    assert_eq!(
+        alts,
+        [
+            ("A kiln at dusk".into(), "Kiln".into(), false),
+            ("Process flow & \"steps\"".into(), String::new(), false),
+            (String::new(), String::new(), true),
+            ("Two circles".into(), String::new(), false),
+        ]
+    );
+    let InlineObject::Group { children, .. } = &objs[3] else { panic!("{objs:?}") };
+    assert_eq!(children[0].obj.alt_text(), "Left circle");
+    let Some(Block::Table(t)) = r.body.iter().map(|b| &**b).find(|b| matches!(b, Block::Table(_))) else { panic!() };
+    assert_eq!((t.props.caption.as_deref(), t.props.description.as_deref()), (Some("Prices"), Some("Prices by year")));
 }
