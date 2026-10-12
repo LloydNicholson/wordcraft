@@ -294,6 +294,10 @@ pub enum ShapeKind {
     TextBox,
     /// A shape drawn point by point, such as ink (its geometry is the shape's `freeform`).
     Freeform,
+    /// Connectors: lines whose ends can be glued to other shapes (see [`crate::connector`]).
+    StraightConnector,
+    ElbowConnector,
+    CurvedConnector,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -404,6 +408,9 @@ pub enum InlineObject {
         /// Shadow, glow and soft edges.
         #[serde(default, skip_serializing_if = "crate::effects::ShapeEffects::is_empty")]
         effects: crate::effects::ShapeEffects,
+        /// Drawing id, text warp, connector ends and arrowheads.
+        #[serde(default, skip_serializing_if = "crate::connector::ShapeExtra::is_empty")]
+        extra: crate::connector::ShapeExtra,
     },
     /// Pictures, shapes and text boxes grouped into one object (Layout › Arrange › Group): it
     /// moves, wraps and resizes as one. Its members are laid out in the group's own coordinate
@@ -475,6 +482,20 @@ pub enum InlineObject {
         id: u32,
     },
     CommentEnd {
+        id: u32,
+    },
+    /// The start of a range that stays editable while the document is protected (Restrict
+    /// Editing exceptions, `w:permStart`): for everyone (`group` = `everyone`), another editing
+    /// group, or one editor (`editor`, a user name or address).
+    PermStart {
+        id: u32,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        group: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        editor: String,
+    },
+    /// The end of the editable range [`InlineObject::PermStart`] with the same `id` opened.
+    PermEnd {
         id: u32,
     },
     /// An equation: its linear format (`x=(-b±√(b^2-4ac))/2a`, for plain text) and structure.
@@ -645,6 +666,8 @@ impl InlineObject {
                 | InlineObject::BookmarkEnd { .. }
                 | InlineObject::CommentStart { .. }
                 | InlineObject::CommentEnd { .. }
+                | InlineObject::PermStart { .. }
+                | InlineObject::PermEnd { .. }
                 | InlineObject::FieldStart { .. }
                 | InlineObject::FieldEnd
                 | InlineObject::ControlStart { .. }

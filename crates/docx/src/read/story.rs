@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use wordcraft_doc::connector::{ConnEnd, ShapeExtra};
 use wordcraft_doc::control::{ContentControl, ControlKind, ControlWrap};
 use wordcraft_doc::effects::{Glow, Shadow, ShapeEffects};
 use wordcraft_doc::graphic::{Embedded, Graphic, GraphicItem, GraphicKind};
@@ -13,8 +14,9 @@ use wordcraft_doc::{Block, Blocks, InlineObject, Paragraph, PartKind, RevisionKi
 use super::Reader;
 use super::props::{sectpr, tcpr, trpr};
 use crate::package::{Rels, rt};
-use crate::units::{int, measure};
+use crate::units::{int, measure, u32_of};
 use crate::xml::El;
+use wordcraft_doc::wordart::TextWarp;
 
 /// Deepest table nesting we build (deeper tables become plain paragraphs).
 const MAX_TABLE_DEPTH: usize = 24;
@@ -39,9 +41,11 @@ enum Phase {
     Result,
 }
 
+/// A buffered piece of a field's result. Objects are boxed: an inline object is much larger than
+/// a string.
 enum Item {
     Text(String),
-    Obj(InlineObject),
+    Obj(Box<InlineObject>),
 }
 
 struct FieldState {
@@ -81,6 +85,16 @@ fn enclosure(f: &FieldState) -> Option<wordcraft_doc::eq::Enclosure> {
 /// several paragraphs (citation managers' `ADDIN` fields: Zotero, Mendeley, EndNote).
 fn is_range_instr(instr: &str) -> bool {
     instr.trim_start().get(..5).is_some_and(|k| k.eq_ignore_ascii_case("ADDIN"))
+}
+
+/// The last paragraph of a block list: its last block, or inside a final table the last
+/// paragraph of its last cell (nested tables to [`MAX_TABLE_DEPTH`]).
+fn last_para_mut(out: &mut Blocks, depth: usize) -> Option<&mut Paragraph> {
+    match Arc::make_mut(out.last_mut()?) {
+        Block::Para(p) => Some(p),
+        Block::Table(t) if depth < MAX_TABLE_DEPTH => last_para_mut(&mut t.rows.last_mut()?.cells.last_mut()?.blocks, depth + 1),
+        Block::Table(_) => None,
+    }
 }
 
 /// The field that buffers content now: the innermost one that isn't a range field, unless it
@@ -195,7 +209,7 @@ impl Reader<'_> {
                         self.read_blocks(sc, c, rels, out, depth + 1);
                     }
                 }
-                "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" => {
+                "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" | "w:permStart" | "w:permEnd" => {
                     if let Some(o) = self.marker(e) {
                         sc.pending.push(o);
                     }
@@ -248,12 +262,13 @@ impl Reader<'_> {
         out.extend(inner);
     }
 
-    /// Markers left over at the end of a story go to its last paragraph.
+    /// Markers left over at the end of a story go to its last paragraph (after a final table:
+    /// the last paragraph of its last cell, so a bookmark around the table keeps its end).
     pub fn flush_pending(&mut self, sc: &mut StoryCtx, out: &mut Blocks) {
         if sc.pending.is_empty() {
             return;
         }
-        if let Some(Block::Para(p)) = out.last_mut().map(Arc::make_mut) {
+        if let Some(p) = last_para_mut(out, 0) {
             for o in sc.pending.drain(..) {
                 let props = p.runs.last().map(|r| r.props.clone()).unwrap_or_default();
                 p.text.push(wordcraft_doc::para::OBJ);
@@ -278,6 +293,21 @@ impl Reader<'_> {
             }
             "w:bookmarkEnd" => self.bookmarks.get(&id).map(|n| InlineObject::BookmarkEnd { name: n.clone() }),
             "w:commentRangeStart" => self.comment_id(&id).map(|id| InlineObject::CommentStart { id }),
+            "w:permStart" => {
+                // Bounded: a hostile file can't grow the map without end.
+                if self.perms.len() >= 100_000 {
+                    return None;
+                }
+                let n = self.perms.len() as u32;
+                let id = *self.perms.entry(id).or_insert(n);
+                let text = |a: &str| e.attr(a).filter(|v| v.len() <= 256).unwrap_or("").to_string();
+                let (group, editor) = (text("w:edGrp"), text("w:ed"));
+                if group.is_empty() && editor.is_empty() {
+                    return None;
+                }
+                Some(InlineObject::PermStart { id, group, editor })
+            }
+            "w:permEnd" => self.perms.get(&id).map(|id| InlineObject::PermEnd { id: *id }),
             "w:commentRangeEnd" => {
                 let cid = self.comment_id(&id)?;
                 self.comments_ended.insert(cid);
@@ -426,7 +456,7 @@ impl Reader<'_> {
                 self.read_inline_children(sc, pb, k, rels, ctx, depth + 1);
                 self.end_field(sc, pb);
             }
-            "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" => {
+            "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" | "w:permStart" | "w:permEnd" => {
                 if let Some(o) = self.marker(k) {
                     let props = self.run_props_none(ctx);
                     // Markers go straight into the paragraph (never into a field's cached result).
@@ -751,6 +781,20 @@ impl Reader<'_> {
             self.emit_obj(sc, pb, InlineObject::FieldEnd, &f.props);
             return;
         }
+        // A cached result holding a picture, chart or shape (`INCLUDEPICTURE`'s embedded
+        // picture) can't be a text result: keep the field as a range around it so the picture
+        // stays in the document and is saved again. The linked source is never read.
+        if !nested_in_instr && f.buf.iter().any(|(it, _)| matches!(it, Item::Obj(o) if o.frame().is_some())) {
+            self.emit_obj(sc, pb, InlineObject::FieldStart { instr: f.instr.trim().to_string(), locked: f.locked }, &f.props);
+            for (it, p) in f.buf {
+                match it {
+                    Item::Text(t) => self.emit_text(sc, pb, &t, &p),
+                    Item::Obj(o) => self.emit_obj(sc, pb, *o, &p),
+                }
+            }
+            self.emit_obj(sc, pb, InlineObject::FieldEnd, &f.props);
+            return;
+        }
         let mut result = String::new();
         for (it, _) in &f.buf {
             match it {
@@ -786,7 +830,7 @@ impl Reader<'_> {
             for (it, p) in f.buf.drain(..) {
                 match it {
                     Item::Text(t) => pb.push_text(&t, &p),
-                    Item::Obj(o) => pb.push_obj(o, &p),
+                    Item::Obj(o) => pb.push_obj(*o, &p),
                 }
             }
         }
@@ -807,7 +851,7 @@ impl Reader<'_> {
         match sink(sc) {
             Some(f) => {
                 if f.phase == Phase::Result && f.buf.len() < 100_000 {
-                    f.buf.push((Item::Obj(o), props.clone()));
+                    f.buf.push((Item::Obj(Box::new(o)), props.clone()));
                 }
             }
             _ => pb.push_obj(o, props),
@@ -881,6 +925,7 @@ impl Reader<'_> {
         if !alt.is_empty() {
             obj.set_alt_text(&alt);
         }
+        self.set_shape_id(&mut obj, c.child("wp:docPr").and_then(|p| p.attr("id")));
         // Word's effect extent also covers a rotated object's overhang; the model keeps that
         // apart (it follows from the angle), so take it back out.
         if let Some(f) = obj.float_mut() {
@@ -901,21 +946,25 @@ impl Reader<'_> {
             GraphicKind::Chart => gd.child("c:chart").and_then(|c| c.attr("r:id")).and_then(|id| super::part_of(rels, id, rt::CHART)),
             GraphicKind::Diagram => self.diagram_part(gd, rels),
         };
-        let Some(path) = part else { return Arc::new(Graphic { kind, items: Vec::new(), w, h, source, chart: None }) };
+        let Some(path) = part else { return Arc::new(Graphic { kind, items: Vec::new(), w, h, source, chart: None, smart_art: None }) };
         let key = (kind, path, w.to_bits(), h.to_bits());
         if let Some(g) = self.graphics.get(&key) {
             return g.clone();
         }
         let items = if self.graphic_budget == 0 { Vec::new() } else { self.graphic_items(kind, &key.1, w, h) };
         self.graphic_budget = self.graphic_budget.saturating_sub(graphic_work(&items));
-        // A chart that is exactly what WordCraft writes for its model can be edited (and is
-        // written from the model); any other stays as it was read.
+        // A chart or SmartArt that is exactly what WordCraft writes for its model can be edited
+        // (and is written from the model); any other stays as it was read.
         let chart = match kind {
             GraphicKind::Chart if !items.is_empty() => self.graphic_part(&key.1).and_then(|space| crate::chart_spec::spec_of(&space)).map(Arc::new),
             _ => None,
         };
-        let source = if chart.is_some() { None } else { source };
-        let g = Arc::new(Graphic { kind, items, w, h, source, chart });
+        let smart_art = match kind {
+            GraphicKind::Diagram if !items.is_empty() => self.smart_art_spec(gd, rels).map(Arc::new),
+            _ => None,
+        };
+        let source = if chart.is_some() || smart_art.is_some() { None } else { source };
+        let g = Arc::new(Graphic { kind, items, w, h, source, chart, smart_art });
         self.graphics.insert(key, g.clone());
         g
     }
@@ -1039,8 +1088,13 @@ impl Reader<'_> {
             let (w, h) = (fit(ew * sx, 0.0), fit(eh * sy, 0.0));
             let (alt, meta) = nv_alt(if e.name == "pic:pic" { e.find("pic:cNvPr") } else { e.child("wps:cNvPr") });
             let float = Float { alt: meta, ..Float::default() };
-            let obj =
-                if e.name == "pic:pic" { self.read_pic(e, rels, w, h, alt.clone(), float) } else { Some(self.read_wsp(sc, e, rels, w, h, float)) };
+            let obj = if e.name == "pic:pic" {
+                self.read_pic(e, rels, w, h, alt.clone(), float)
+            } else {
+                let mut o = self.read_wsp(sc, e, rels, w, h, float);
+                self.set_shape_id(&mut o, e.child("wps:cNvPr").and_then(|p| p.attr("id")));
+                Some(o)
+            };
             let obj = obj.map(|mut o| {
                 o.set_alt_text(&alt);
                 o
@@ -1061,7 +1115,10 @@ impl Reader<'_> {
             "ellipse" => ShapeKind::Ellipse,
             "triangle" | "rtTriangle" => ShapeKind::Triangle,
             "diamond" => ShapeKind::Diamond,
-            "line" | "straightConnector1" => ShapeKind::Line,
+            "line" => ShapeKind::Line,
+            "straightConnector1" => ShapeKind::StraightConnector,
+            "bentConnector2" | "bentConnector3" | "bentConnector4" | "bentConnector5" => ShapeKind::ElbowConnector,
+            "curvedConnector2" | "curvedConnector3" | "curvedConnector4" | "curvedConnector5" => ShapeKind::CurvedConnector,
             "rightArrow" | "leftArrow" | "upArrow" | "downArrow" => ShapeKind::Arrow,
             "star5" | "star4" | "star6" => ShapeKind::Star,
             "heart" => ShapeKind::Heart,
@@ -1118,7 +1175,35 @@ impl Reader<'_> {
                 part.body.anchor = wordcraft_doc::props::valign_from_anchor(a);
             }
         }
-        InlineObject::Shape { kind, w, h, fill, stroke, stroke_width, float, story, freeform: None, effects }
+        let mut extra = ShapeExtra::default();
+        // Arrowheads: any end type but `none` (ECMA-376 §20.1.10.33) is drawn as a triangle.
+        let arrow = |tag: &str| ln.and_then(|l| l.child(tag)).and_then(|e| e.attr("type")).is_some_and(|t| t != "none");
+        extra.arrow_start = arrow("a:headEnd");
+        extra.arrow_end = arrow("a:tailEnd");
+        // A connector's glued ends (ECMA-376 §20.1.2.2.36, §20.1.2.2.13).
+        if let Some(cn) = wsp.child("wps:cNvCnPr") {
+            let end = |tag: &str| {
+                let e = cn.child(tag)?;
+                let id = e.attr("id").and_then(u32_of).filter(|v| *v != 0)?;
+                let site = e.attr("idx").and_then(u32_of).unwrap_or(0).min(wordcraft_doc::connector::MAX_SITE);
+                Some(ConnEnd { id, site })
+            };
+            extra.start = end("a:stCxn");
+            extra.end = end("a:endCxn");
+            self.glued.extend(extra.start.iter().chain(extra.end.iter()).map(|e| e.id));
+        }
+        extra.warp = wsp.child("wps:bodyPr").and_then(|b| b.child("a:prstTxWarp")).and_then(text_warp);
+        InlineObject::Shape { kind, w, h, fill, stroke, stroke_width, float, story, freeform: None, effects, extra }
+    }
+
+    /// Keep drawing id `id` on a shape read from a file (see [`Reader::glued`]).
+    fn set_shape_id(&mut self, obj: &mut InlineObject, id: Option<&str>) {
+        if let InlineObject::Shape { extra, .. } = obj
+            && let Some(id) = id.and_then(u32_of).filter(|v| *v != 0)
+        {
+            extra.id = id;
+            self.shape_ids = true;
+        }
     }
 
     fn read_textbox(&mut self, sc: &StoryCtx, content: &El, rels: &Rels) -> u32 {
@@ -1159,6 +1244,7 @@ impl Reader<'_> {
                 story,
                 freeform: None,
                 effects: Default::default(),
+                extra: Default::default(),
             });
         }
         None
@@ -1465,6 +1551,19 @@ fn graphic_work(items: &[GraphicItem]) -> usize {
 
 /// A shape's `a:effectLst` (ECMA-376 Part 1 §20.1.8.26): its outer shadow, glow and soft edges.
 /// Other effects are dropped.
+/// A preset text warp (`a:prstTxWarp`, ECMA-376 §20.1.9.19) and its adjust values
+/// (`a:avLst/a:gd` with `fmla="val N"`). Unknown presets are dropped.
+fn text_warp(e: &El) -> Option<TextWarp> {
+    let mut w = TextWarp::new(e.attr("prst")?)?;
+    for gd in e.child("a:avLst").into_iter().flat_map(|l| l.children("a:gd")) {
+        let (Some(name), Some(f)) = (gd.attr("name"), gd.attr("fmla")) else { continue };
+        if let Some(v) = f.trim().strip_prefix("val").and_then(|v| v.trim().parse::<i64>().ok()) {
+            w.set_adj(name, v);
+        }
+    }
+    Some(w)
+}
+
 fn effect_list(l: &El) -> ShapeEffects {
     let pt = |e: &El, n: &str| e.attr(n).and_then(|v| measure(v, 12_700.0)).unwrap_or(0.0);
     let shadow = l.child("a:outerShdw").map(|e| {

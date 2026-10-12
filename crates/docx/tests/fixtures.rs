@@ -1255,3 +1255,114 @@ fn note_separators_and_continuation_notice_round_trip() {
     assert!(settings.contains(r#"<w:footnote w:id="-1"/><w:footnote w:id="0"/><w:footnote w:id="1"/>"#), "{settings}");
     check(&wordcraft_docx::read(&out).unwrap());
 }
+
+/// Issue #534: East Asian number formats are read, labelled and written back as they were; a
+/// value the format doesn't define is decimal, and a level without `w:ind` has no indent.
+#[test]
+fn east_asian_number_formats_read_label_and_round_trip() {
+    use wordcraft_doc::numbering::Counters;
+    use wordcraft_doc::section::NumFormat;
+    let lvl = |i: u8, fmt: &str, text: &str| {
+        format!(r#"<w:lvl w:ilvl="{i}"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/><w:suff w:val="nothing"/><w:lvlText w:val="{text}"/></w:lvl>"#)
+    };
+    let levels = [
+        lvl(0, "chineseCounting", "%1、"),
+        lvl(1, "chineseCountingThousand", "第%2章"),
+        lvl(2, "japaneseLegal", "（%3）"),
+        lvl(3, "decimalEnclosedCircle", "%4"),
+        lvl(4, "hebrew1", "%5."),
+        lvl(5, "notAFormat", "%6."),
+    ]
+    .concat();
+    let numbering = format!(
+        r#"<w:numbering {W_NS}><w:abstractNum w:abstractNumId="0">{levels}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+    );
+    let item = |lv: u8| format!(r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{lv}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#);
+    let body: String = [0, 0, 0, 1, 2, 3, 4, 5].map(item).concat();
+    let bytes = docx(&body, &[("rId1", "numbering", "numbering.xml")], &[("word/numbering.xml", &numbering)]);
+    let d = wordcraft_docx::read(&bytes).unwrap();
+    let formats = |d: &Document| (0..6).map(|i| d.numbering.level(1, i).map(|l| l.format)).collect::<Vec<_>>();
+    let want = [
+        NumFormat::ChineseCounting,
+        NumFormat::ChineseCountingThousand,
+        NumFormat::JapaneseLegal,
+        NumFormat::DecimalEnclosedCircle,
+        NumFormat::Hebrew1,
+        NumFormat::Decimal,
+    ]
+    .map(Some);
+    assert_eq!(formats(&d), want);
+    assert_eq!(d.numbering.level(1, 0).map(|l| (l.indent, l.hanging)), Some((0.0, 0.0)));
+    let mut c = Counters::default();
+    let labels: Vec<String> =
+        paras(&d).iter().filter_map(|p| p.props.numbering).filter_map(|n| c.next_label(&d.numbering, n.num, n.level)).map(|l| l.0).collect();
+    assert_eq!(labels, ["一、", "二、", "三、", "第一章", "（壱）", "①", "1.", "1."]);
+    // Saved and read again, every format is the one the file had (hebrew1 too, which shows as
+    // decimal for now).
+    let out = wordcraft_docx::write(&d).unwrap();
+    let back = wordcraft_docx::read(&out).unwrap();
+    assert_eq!(formats(&back), want);
+}
+
+/// #464: a bookmark whose end follows the document's final table keeps its end (it goes into
+/// the table's last cell) and is saved as a matched pair.
+#[test]
+fn bookmark_around_final_table_keeps_its_end() {
+    let body = r#"<w:bookmarkStart w:id="7" w:name="TableRange"/><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:bookmarkEnd w:id="7"/><w:sectPr/>"#;
+    let d = read_body(body);
+    let marks = |d: &Document| {
+        let Block::Table(t) = &*d.body[0] else { panic!("{:?}", d.body[0]) };
+        t.rows[0].cells[0].blocks[0].as_para().unwrap().objects.clone()
+    };
+    let want = vec![InlineObject::BookmarkStart { name: "TableRange".into() }, InlineObject::BookmarkEnd { name: "TableRange".into() }];
+    assert_eq!(marks(&d), want);
+    let again = wordcraft_docx::read(&wordcraft_docx::write(&d).unwrap()).unwrap();
+    assert_eq!(marks(&again), want);
+    assert_eq!(again.bookmarks().len(), 1);
+}
+
+/// #465: a field whose cached result is an embedded picture (`INCLUDEPICTURE`, simple, complex or
+/// locked) keeps the picture through reading and saving; the linked file is never read.
+#[test]
+fn includepicture_keeps_its_embedded_picture() {
+    let png: &[u8] = b"\x89PNG\r\n\x1a\nstand-in";
+    let pic = r#"<w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="P"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdPic"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#;
+    let cases = [
+        (format!(r#"<w:fldSimple w:instr="INCLUDEPICTURE &quot;picture.png&quot;">{pic}</w:fldSimple>"#), false),
+        (format!(r#"<w:fldSimple w:instr="INCLUDEPICTURE &quot;picture.png&quot;" w:fldLock="1">{pic}</w:fldSimple>"#), true),
+        (
+            format!(
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> INCLUDEPICTURE "picture.png" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>{pic}<w:r><w:fldChar w:fldCharType="end"/></w:r>"#
+            ),
+            false,
+        ),
+    ];
+    for (field, locked) in cases {
+        let bytes = docx(&format!("<w:p>{field}</w:p><w:sectPr/>"), &[("rIdPic", "image", "media/picture.png")], &[]);
+        let bytes = {
+            // `docx` takes text parts; add the picture bytes as a binary part.
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+            for i in 0..z.len() {
+                let mut f = z.by_index(i).unwrap();
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut v).unwrap();
+                entries.push((f.name().to_string(), v));
+            }
+            entries.push(("word/media/picture.png".into(), png.to_vec()));
+            zip(&entries.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect::<Vec<_>>())
+        };
+        let check = |d: &Document| {
+            let p = paras(d);
+            let objs = &p[0].objects;
+            assert_eq!(objs.len(), 3, "{objs:?}");
+            assert_eq!(objs[0], InlineObject::FieldStart { instr: "INCLUDEPICTURE \"picture.png\"".into(), locked });
+            let InlineObject::Image { media, .. } = &objs[1] else { panic!("{objs:?}") };
+            assert_eq!(d.media.get(media).unwrap().as_slice(), png);
+            assert_eq!(objs[2], InlineObject::FieldEnd);
+        };
+        let d = wordcraft_docx::read(&bytes).unwrap();
+        check(&d);
+        check(&wordcraft_docx::read(&wordcraft_docx::write(&d).unwrap()).unwrap());
+    }
+}
